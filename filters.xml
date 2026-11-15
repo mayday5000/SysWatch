@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<filters>
+  <!-- placeholder. deploy.sh rewrites this from the running session. -->
+  <hide kind="sysid">0</hide>
+</filters>
