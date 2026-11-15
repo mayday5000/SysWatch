@@ -320,4 +320,4 @@ sudo rmmod syscall_monitor
 
 **License**
 
-This project is licensed under the [<u>MIT License</u>](https://github.com/mayday5000/Driver-DevBox-Automation/blob/main/LICENSE). Copyright (c) 2026 Damian Andres Ulanowicz.
+This project is licensed under the [<u>MIT License</u>](https://github.com/mayday5000/SysWatch/blob/main/LICENSE). Copyright (c) 2026 Damian Andres Ulanowicz.
