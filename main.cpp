@@ -591,11 +591,13 @@ private:
     MockEventGenerator mock_;
 };
 
-static int32_t parse_args(int argc, char **argv) {
+static int32_t parse_args(int argc, char **argv, std::string &filters_path) {
     int32_t fpid = 0;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc)
             fpid = static_cast<int32_t>(std::strtol(argv[++i], nullptr, 10));
+        else if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc)
+            filters_path = argv[++i];
         else if (std::strcmp(argv[i], "-h") == 0)
             std::exit(2);
     }
@@ -643,10 +645,10 @@ class App {
 public:
     int run(int argc, char **argv) {
         state_.has_lsof = check_lsof_presence();
-        fpid_ = parse_args(argc, argv);
+        fpid_ = parse_args(argc, argv, filters_path_);
         auto opened = open_device(fpid_);
         if (opened) dev_ = std::move(*opened);
-        filters_ = std::make_unique<FilterStore>("filters.xml");
+        filters_ = std::make_unique<FilterStore>(filters_path_);
         load_syscall_names(state_);
         view_ = std::make_unique<View>(20);
         term_ = std::make_unique<Terminal>();
@@ -720,6 +722,7 @@ public:
 private:
     tui::UiState state_;
     int32_t fpid_ = 0;
+    std::string filters_path_ = "filters.xml";
     std::unique_ptr<Fd> dev_;
     std::unique_ptr<FilterStore> filters_;
     std::unique_ptr<View> view_;

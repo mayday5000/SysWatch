@@ -43,7 +43,6 @@ public:
     
     static std::vector<FilterRule> parse(std::string_view xml, int32_t cap = 32);
     static std::vector<FilterRule> seed();
-    static bool default_hidden(std::string_view comm, int32_t nr);
 
 private:
     std::string path_;

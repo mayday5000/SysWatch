@@ -38,8 +38,9 @@ ensure_pkg() {
     fi
 }
 
+# ps shows comm, which the kernel truncates to 15 bytes; compare on those.
 running() {
-    ps -eo comm= 2>/dev/null | awk -v n="$1" '$0==n {found=1} END {exit !found}'
+    ps -eo comm= 2>/dev/null | awk -v n="${1:0:15}" '$0==n {found=1} END {exit !found}'
 }
 
 emit_filters() {
