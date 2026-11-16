@@ -33,6 +33,7 @@ add_executable(syswatch
     view.cpp
     capture.cpp
     syscall_table.cpp
+    text_util.cpp
 )
 
 # -----------------------------------------------------------------------------
@@ -69,6 +70,7 @@ target_sources(syswatch PRIVATE
     mock_generator.hpp
     syscall_monitor_shared.h
     syscall_table.hpp
+    text_util.hpp
 )
 
 # Ensure the source tree directory is mounted on runtime include paths

@@ -5,6 +5,7 @@
 #include "capture.hpp"
 #include "mock_generator.hpp"
 #include "syscall_table.hpp"
+#include "text_util.hpp"
 /*
  * main.cpp
  * Purpose: the userspace program. Owns the terminal, the device or the
@@ -156,9 +157,11 @@ static int on_raw_kernel_event(const sm_event &raw, void *user_data) {
     e.pid = raw.pid;
     e.nr = raw.nr;
     e.ts_ns = raw.ts_ns;
-    e.comm.assign(raw.comm, strnlen(raw.comm, SM_COMM_LEN));
+    // comm and the path argument are attacker-controlled; never let them
+    // reach the terminal (or the capture file) as raw control bytes.
+    e.comm = sanitize_terminal(std::string_view(raw.comm, strnlen(raw.comm, SM_COMM_LEN)));
     e.sys_name = syscall_name(raw.nr);
-    e.extra.assign(raw.arg_str, strnlen(raw.arg_str, SM_ARG_STR_LEN));
+    e.extra = sanitize_terminal(std::string_view(raw.arg_str, strnlen(raw.arg_str, SM_ARG_STR_LEN)));
 
     if (ctx->filters->hidden(e.comm, e.pid, e.nr, e.sys_name)) {
         return 0; 
@@ -221,7 +224,7 @@ static void populate_lsof_buffer(const IView &view, tui::UiState &state) {
         std::string line(chunk.data());
         if (!line.empty() && line.back() == '\n') line.pop_back();
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) state.lsof_lines.push_back(line);
+        if (!line.empty()) state.lsof_lines.push_back(sanitize_terminal(line));
     }
     pclose(pipe);
 
