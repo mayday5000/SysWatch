@@ -62,7 +62,10 @@ typedef uint64_t sm_u64;
 
 #define SM_COMM_LEN             (16)
 #define SM_ARG_STR_LEN          (128)
-#define SM_EVENT_RING_SIZE      (512)
+/* Records kept by the kernel ring (720 KB) and the most one read() returns.
+ * Not part of the record ABI: a reader with a smaller buffer just gets
+ * fewer records per read(). Must be a power of two. */
+#define SM_EVENT_RING_SIZE      (4096)
 #define SM_EVENT_RING_MASK      (SM_EVENT_RING_SIZE - 1)
 #define SM_EVENT_SIZE           (176)    /* 4+4+8+8+8+16+128 */
 

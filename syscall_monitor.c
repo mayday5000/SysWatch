@@ -6,6 +6,7 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
@@ -123,7 +124,9 @@ static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
     syscall_get_arguments(current, regs, 0, 6, args);
 #endif
 
-    ev.pid = (sm_s32)current->pid;
+    /* Process ID (tgid), as getpid(), lsof -p and the TUI's -p expect;
+     * current->pid would be the thread ID. */
+    ev.pid = (sm_s32)task_tgid_nr(current);
     ev.nr = (sm_s32)id;
     ev.ts_ns = (sm_u64)ktime_get_real_ns();
     strscpy(ev.comm, current->comm, sizeof(ev.comm));
@@ -180,7 +183,7 @@ static long sm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     case CLEAR_FILTERS:
         break;
     default:
-        return -EINVAL;
+        return -ENOTTY;     /* the convention for an unknown ioctl */
     }
 
     if (mutex_lock_interruptible(&priv->lock))
@@ -261,7 +264,9 @@ static int sm_open(struct inode *inode, struct file *filp)
     if (!priv)
         return -ENOMEM;
 
-    priv->snap = kmalloc_array(SM_EVENT_RING_SIZE, SM_EVENT_SIZE, GFP_KERNEL);
+    /* One ring's worth of records; kvmalloc so a fragmented system can
+     * fall back to vmalloc instead of failing a high-order allocation. */
+    priv->snap = kvmalloc_array(SM_EVENT_RING_SIZE, SM_EVENT_SIZE, GFP_KERNEL);
     if (!priv->snap) {
         kfree(priv);
         return -ENOMEM;
@@ -286,7 +291,7 @@ static int sm_release(struct inode *inode, struct file *filp)
     (void)inode;
     if (priv) {
         mutex_destroy(&priv->lock);
-        kfree(priv->snap);
+        kvfree(priv->snap);
         kfree(priv);
     }
     return 0;
@@ -463,7 +468,8 @@ static int __init syscall_monitor_init(void)
 
     cdev_init(&mon_ctx.cdev, &sm_fops);
     mon_ctx.cdev.owner = THIS_MODULE;
-    if (cdev_add(&mon_ctx.cdev, mon_ctx.dev_num, 1) < 0)
+    ret = cdev_add(&mon_ctx.cdev, mon_ctx.dev_num, 1);
+    if (ret < 0)
         goto err_region;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
@@ -471,20 +477,29 @@ static int __init syscall_monitor_init(void)
 #else
     mon_ctx.cls = class_create(THIS_MODULE, CLASS_NAME);
 #endif
-    if (IS_ERR(mon_ctx.cls))
+    if (IS_ERR(mon_ctx.cls)) {
+        ret = PTR_ERR(mon_ctx.cls);
         goto err_cdev;
+    }
 
     mon_ctx.dev = device_create(mon_ctx.cls, NULL, mon_ctx.dev_num, NULL, DEVICE_NAME);
-    if (IS_ERR(mon_ctx.dev))
+    if (IS_ERR(mon_ctx.dev)) {
+        ret = PTR_ERR(mon_ctx.dev);
         goto err_class;
+    }
 
     for_each_kernel_tracepoint(find_sys_enter_tp, &mon_ctx.tp_sys_enter);
-    if (!mon_ctx.tp_sys_enter)
+    if (!mon_ctx.tp_sys_enter) {
+        pr_err("syscall_monitor: sys_enter tracepoint not found (CONFIG_FTRACE_SYSCALLS?)\n");
+        ret = -ENOENT;
         goto err_device;
+    }
 
     ret = tracepoint_probe_register(mon_ctx.tp_sys_enter, (void *)probe_sys_enter, NULL);
-    if (ret)
+    if (ret) {
+        mon_ctx.tp_sys_enter = NULL;
         goto err_device;
+    }
 
     pr_info("syscall_monitor: loaded (broadcast ring %u, rec %u)\n",
             SM_EVENT_RING_SIZE, (unsigned int)SM_EVENT_SIZE);
@@ -498,7 +513,7 @@ err_cdev:
     cdev_del(&mon_ctx.cdev);
 err_region:
     unregister_chrdev_region(mon_ctx.dev_num, 1);
-    return -ENODEV;
+    return ret;
 }
 
 static void __exit syscall_monitor_exit(void)
