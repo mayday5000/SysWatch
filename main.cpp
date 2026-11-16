@@ -6,6 +6,7 @@
 #include "mock_generator.hpp"
 #include "syscall_table.hpp"
 #include "text_util.hpp"
+#include "decode.hpp"
 /*
  * main.cpp
  * Purpose: the userspace program. Owns the terminal, the device or the
@@ -177,23 +178,6 @@ struct EventLoopContext {
     Capture *cap = nullptr;
     IView *view = nullptr;
 };
-
-// decode_events walks a read() buffer as whole records. std::span carries
-// the pointer and the length together, so a short count cannot be passed
-// with the wrong size. A partial record is rejected, not split.
-static bool decode_events(std::span<const uint8_t> buf, int (*fn)(const sm_event &, void *), void *ud) {
-    if (buf.empty() || buf.size() % SM_EVENT_SIZE != 0)
-        return false;
-    for (size_t off = 0; off < buf.size(); off += SM_EVENT_SIZE) {
-        sm_event ev{};
-        std::memcpy(&ev, buf.data() + off, SM_EVENT_SIZE);
-        ev.comm[SM_COMM_LEN - 1] = '\0';
-        ev.arg_str[SM_ARG_STR_LEN - 1] = '\0';
-        if (fn && fn(ev, ud))
-            return false;
-    }
-    return true;
-}
 
 // True for a 32-bit TUI on a 64-bit kernel. The generated name table is
 // for the ABI the TUI was compiled for, so it names compat records then,
