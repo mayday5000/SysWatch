@@ -216,7 +216,6 @@ static int sm_open(struct inode *inode, struct file *filp)
     struct sm_priv *priv;
     unsigned long flags;
 
-    (void)inode;
     if (!sm_capable())
         return -EPERM;
     priv = kzalloc(sizeof(*priv), GFP_KERNEL);
@@ -239,7 +238,8 @@ static int sm_open(struct inode *inode, struct file *filp)
     spin_unlock_irqrestore(&mon_ctx.lock, flags);
 
     filp->private_data = priv;
-    return 0;
+    /* No seeking. Replaces .llseek = no_llseek, which 6.12 removed. */
+    return nonseekable_open(inode, filp);
 }
 
 static int sm_release(struct inode *inode, struct file *filp)
@@ -344,7 +344,6 @@ static const struct file_operations sm_fops = {
     .read           = sm_read,
     .poll           = sm_poll,
     .unlocked_ioctl = sm_ioctl,
-    .llseek         = no_llseek,
 };
 
 static int __init syscall_monitor_init(void)
