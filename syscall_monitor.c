@@ -78,8 +78,15 @@ static void find_sys_enter_tp(struct tracepoint *tp, void *priv)
 }
 
 /*
- * Copy a user string without faulting. The probe runs in atomic context,
- * so a page that is not resident yields "[EFAULT]" instead of a sleep.
+ * Copy a user string without faulting. The probe runs in atomic context
+ * (before 6.13 the sys_enter tracepoint always does, and the probe treats
+ * it that way on every kernel), so a page that is not resident yields
+ * "[EFAULT]" instead of a sleep. dst is zeroed and SM_ARG_STR_LEN long,
+ * so the result is always NUL-terminated.
+ *
+ * This is what strncpy_from_user_nofault() does internally, but that
+ * helper is not exported to modules; strncpy_from_user() is, and it
+ * checks access_ok() itself.
  */
 static void sm_copy_user_str(char *dst, unsigned long uptr)
 {
