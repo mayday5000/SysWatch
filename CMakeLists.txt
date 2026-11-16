@@ -32,7 +32,33 @@ add_executable(syswatch
     renderer.cpp
     view.cpp
     capture.cpp
+    syscall_table.cpp
 )
+
+# -----------------------------------------------------------------------------
+# Syscall number -> name table, generated for the target architecture from
+# <sys/syscall.h> with the same compiler and flags as the TUI.
+# -----------------------------------------------------------------------------
+set(SYSWATCH_SYSCALL_INC ${CMAKE_CURRENT_BINARY_DIR}/generated/syscall_names.inc)
+separate_arguments(syswatch_gen_flags NATIVE_COMMAND "${CMAKE_CXX_FLAGS}")
+if(CMAKE_CXX_COMPILER_TARGET)
+    list(APPEND syswatch_gen_flags "--target=${CMAKE_CXX_COMPILER_TARGET}")
+endif()
+if(CMAKE_SYSROOT)
+    list(APPEND syswatch_gen_flags "--sysroot=${CMAKE_SYSROOT}")
+endif()
+add_custom_command(
+    OUTPUT ${SYSWATCH_SYSCALL_INC}
+    COMMAND ${CMAKE_COMMAND}
+            -DCXX=${CMAKE_CXX_COMPILER}
+            "-DCXX_FLAGS=${syswatch_gen_flags}"
+            -DOUT=${SYSWATCH_SYSCALL_INC}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_syscall_names.cmake
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_syscall_names.cmake
+    COMMENT "Generating syscall name table"
+    VERBATIM
+)
+target_sources(syswatch PRIVATE ${SYSWATCH_SYSCALL_INC})
 
 # Track headers explicitly for asset graph changes and IDE indexing structures
 target_sources(syswatch PRIVATE
@@ -42,11 +68,13 @@ target_sources(syswatch PRIVATE
     renderer.hpp
     mock_generator.hpp
     syscall_monitor_shared.h
+    syscall_table.hpp
 )
 
 # Ensure the source tree directory is mounted on runtime include paths
 target_include_directories(syswatch PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 # -----------------------------------------------------------------------------

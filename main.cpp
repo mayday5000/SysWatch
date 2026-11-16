@@ -4,6 +4,7 @@
 #include "renderer.hpp"
 #include "capture.hpp"
 #include "mock_generator.hpp"
+#include "syscall_table.hpp"
 /*
  * main.cpp
  * Purpose: the userspace program. Owns the terminal, the device or the
@@ -156,7 +157,7 @@ static int on_raw_kernel_event(const sm_event &raw, void *user_data) {
     e.nr = raw.nr;
     e.ts_ns = raw.ts_ns;
     e.comm.assign(raw.comm, strnlen(raw.comm, SM_COMM_LEN));
-    e.sys_name = "sys_" + std::to_string(raw.nr);
+    e.sys_name = syscall_name(raw.nr);
     e.extra.assign(raw.arg_str, strnlen(raw.arg_str, SM_ARG_STR_LEN));
 
     if (ctx->filters->hidden(e.comm, e.pid, e.nr, e.sys_name)) {
@@ -263,7 +264,7 @@ static void fill_pick_list(const IView &view, const IFilterStore &filters, tui::
             std::find(state.seen_procs.begin(), state.seen_procs.end(), e->comm) == state.seen_procs.end())
             state.seen_procs.push_back(e->comm);
     }
-    for (int32_t id = 0; id < 512; ++id) {
+    for (int32_t id = 0; id < syscall_count(); ++id) {
         if (!already(filters, RuleKind::SysId, id, {}))
             state.seen_sysids.push_back(id);
     }
@@ -561,9 +562,8 @@ static std::expected<std::unique_ptr<Fd>, int> open_device(int32_t fpid) {
 }
 
 static void load_syscall_names(tui::UiState &state) {
-    #include "syscall_names.inc"
-    for (const char *name : kSyscallNames)
-        state.syscall_names.emplace_back(name);
+    for (const SyscallName &s : syscall_table())
+        state.syscall_names.emplace_back(s.name);
 }
 
 static int64_t now_ms() {
