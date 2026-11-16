@@ -53,13 +53,14 @@ void View::on_key(Key key) {
     dirty_ = true;
 }
 
-void View::set_sort(Sort sort) { sort_ = sort; rebuild(); dirty_ = true; }
-void View::set_desc(bool desc) { desc_ = desc; rebuild(); dirty_ = true; }
+void View::set_sort(Sort sort) { sort_ = sort; mark_unsorted(); dirty_ = true; }
+void View::set_desc(bool desc) { desc_ = desc; mark_unsorted(); dirty_ = true; }
 void View::set_rows(int32_t rows) { rows_ = rows > 0 ? rows : 1; clamp(); dirty_ = true; }
 
 const UiEvent *View::row(int32_t visible) const {
     int32_t i = top_ + visible;
     if (i < 0 || i >= n_) return nullptr;
+    if (order_stale_) rebuild();
     return &ring_[static_cast<size_t>(slot_[static_cast<size_t>(order_[static_cast<size_t>(i)])])];
 }
 
@@ -75,7 +76,7 @@ void View::push(UiEvent ev) {
     }
     ring_[static_cast<size_t>(wr_)] = std::move(ev);
     wr_ = (wr_ + 1) % kCap;
-    rebuild();
+    mark_unsorted();
     if (follow_) top_ = sel_ = 0;
     clamp();
     dirty_ = true;
@@ -104,12 +105,13 @@ int32_t View::cmp(int32_t ia, int32_t ib) const {
     return desc_ ? -c : c;
 }
 
-void View::rebuild() {
+void View::rebuild() const {
     for (int32_t i = 0; i < n_; i++)
         order_[static_cast<size_t>(i)] = i;
     std::stable_sort(order_.begin(), order_.begin() + n_, [this](int32_t a, int32_t b) {
         return cmp(a, b) < 0;
     });
+    order_stale_ = false;
 }
 
 void View::clamp() {

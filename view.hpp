@@ -28,12 +28,16 @@ private:
     void push(UiEvent ev);
     void flush();
     int32_t cmp(int32_t ia, int32_t ib) const;
-    void rebuild();
+    // Sorting is deferred until a row is read (once per frame), instead of
+    // re-sorting all rows for every appended event.
+    void rebuild() const;
+    void mark_unsorted() { order_stale_ = true; }
     void clamp();
 
     std::array<UiEvent, 512> ring_{};
     std::array<int32_t, 512> slot_{};
-    std::array<int32_t, 512> order_{};
+    mutable std::array<int32_t, 512> order_{};
+    mutable bool order_stale_ = true;
     std::vector<UiEvent> pending_;
     int32_t n_ = 0;
     int32_t wr_ = 0;
