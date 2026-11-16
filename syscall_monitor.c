@@ -15,6 +15,7 @@
 #include <linux/poll.h>
 #include <linux/ktime.h>
 #include <linux/string.h>
+#include <linux/capability.h>
 #include <asm/syscall.h>
 
 #include "syscall_monitor_shared.h"
@@ -196,12 +197,28 @@ static long sm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     return 0;
 }
 
+/*
+ * The stream shows every process's pid, comm, opened paths and exec'd
+ * filenames, so opening it needs the same privilege as perf tracing:
+ * CAP_PERFMON (5.8+) or CAP_SYS_ADMIN. The node itself is root-only 0600.
+ */
+static bool sm_capable(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+    return perfmon_capable();
+#else
+    return capable(CAP_SYS_ADMIN);
+#endif
+}
+
 static int sm_open(struct inode *inode, struct file *filp)
 {
     struct sm_priv *priv;
     unsigned long flags;
 
     (void)inode;
+    if (!sm_capable())
+        return -EPERM;
     priv = kzalloc(sizeof(*priv), GFP_KERNEL);
     if (!priv)
         return -ENOMEM;
@@ -320,18 +337,6 @@ static __poll_t sm_poll(struct file *filp, poll_table *wait)
     return mask;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
-static char *sm_devnode(const struct device *dev, umode_t *mode)
-#else
-static char *sm_devnode(struct device *dev, umode_t *mode)
-#endif
-{
-    (void)dev;
-    if (mode)
-        *mode = 0666;
-    return NULL;
-}
-
 static const struct file_operations sm_fops = {
     .owner          = THIS_MODULE,
     .open           = sm_open,
@@ -368,7 +373,6 @@ static int __init syscall_monitor_init(void)
     if (IS_ERR(mon_ctx.cls))
         goto err_cdev;
 
-    mon_ctx.cls->devnode = sm_devnode;
     mon_ctx.dev = device_create(mon_ctx.cls, NULL, mon_ctx.dev_num, NULL, DEVICE_NAME);
     if (IS_ERR(mon_ctx.dev))
         goto err_class;

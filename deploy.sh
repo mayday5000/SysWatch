@@ -145,14 +145,19 @@ if [[ ! -f ${BUILD_DIR}/${MODULE_NAME}.ko ]]; then
     exit 0
 fi
 
+# Older versions installed a udev rule that made the node world-readable
+# (0666). The stream exposes every process's syscalls, so remove it and
+# keep the kernel default: root-only 0600, and CAP_PERFMON/CAP_SYS_ADMIN
+# is checked again in open().
+if [[ -f "${UDEV_RULE_FILE}" ]]; then
+    log_info "removing legacy world-readable udev rule ${UDEV_RULE_FILE}"
+    sudo rm -f "${UDEV_RULE_FILE}"
+    sudo udevadm control --reload-rules || true
+fi
 if grep -q "^${MODULE_NAME} " /proc/modules 2>/dev/null; then
     log_info "unloading existing ${MODULE_NAME}"
     sudo rmmod "${MODULE_NAME}" || true
 fi
 log_info "insmod ${BUILD_DIR}/${MODULE_NAME}.ko"
 sudo insmod "${BUILD_DIR}/${MODULE_NAME}.ko"
-echo "KERNEL==\"${MODULE_NAME}\", MODE=\"0666\"" | sudo tee "${UDEV_RULE_FILE}" >/dev/null
-sudo udevadm control --reload-rules || true
-sudo udevadm trigger || true
-sudo chmod 666 "/dev/${MODULE_NAME}" || true
-log_info "installed. next: ./${BUILD_DIR}/syswatch"
+log_info "installed. next: sudo ./${BUILD_DIR}/syswatch"

@@ -535,6 +535,9 @@ static std::expected<std::unique_ptr<Fd>, int> open_device(int32_t fpid) {
         int err = errno;
         std::cout << tui::ansi::warn_yellow << "Cannot open /dev/syscall_monitor: "
                   << std::strerror(err) << tui::ansi::style_reset << "\n";
+        if (err == EPERM || err == EACCES)
+            std::cout << "The device needs root, CAP_PERFMON or CAP_SYS_ADMIN "
+                         "(sudo ./build/syswatch).\n";
         std::cout << tui::ansi::info_green << "Simulator mode in 2 seconds..."
                   << tui::ansi::style_reset << "\n";
         ::sleep(2);
