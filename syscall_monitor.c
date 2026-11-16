@@ -44,8 +44,7 @@ MODULE_VERSION("1.1");
  */
 struct sm_priv {
     struct mutex lock;
-    unsigned int read_index;
-    unsigned long last_seq;
+    unsigned long next_seq;     /* seq of the next record to examine */
     struct sm_event *snap;
     pid_t filter_pid;
     pid_t exclude_pid;
@@ -53,10 +52,15 @@ struct sm_priv {
     sm_s32 sys_ids[SM_MAX_NR_FILTERS];
 };
 
+/*
+ * Broadcast ring. seq counts records ever written; record k lives in
+ * ring[k & SM_EVENT_RING_MASK]. lock is a raw spinlock because the probe
+ * runs with preemption disabled (a spinlock_t sleeps on PREEMPT_RT), and
+ * it is only ever held for one 176-byte copy on either side.
+ */
 static struct {
     struct sm_event ring[SM_EVENT_RING_SIZE];
-    unsigned int head;
-    spinlock_t lock;
+    raw_spinlock_t lock;
     wait_queue_head_t waitq;
     unsigned long seq;
     dev_t dev_num;
@@ -72,20 +76,38 @@ static void find_sys_enter_tp(struct tracepoint *tp, void *priv)
         *(struct tracepoint **)priv = tp;
 }
 
+/*
+ * Copy a user string without faulting. The probe runs in atomic context,
+ * so a page that is not resident yields "[EFAULT]" instead of a sleep.
+ */
+static void sm_copy_user_str(char *dst, unsigned long uptr)
+{
+    long res;
+
+    if (!uptr)
+        return;
+    pagefault_disable();
+    res = strncpy_from_user(dst, (const char __user *)uptr, SM_ARG_STR_LEN - 1);
+    pagefault_enable();
+    if (res < 0) {
+        memset(dst, 0, SM_ARG_STR_LEN);
+        strscpy(dst, "[EFAULT]", SM_ARG_STR_LEN);
+    }
+}
+
 static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
 {
     unsigned long flags;
-    struct sm_event *ev;
+    struct sm_event ev;
     unsigned long args[6] = { 0 };
-    char path[SM_ARG_STR_LEN];
-    sm_u64 arg_a = 0, arg_b = 0;
-    pid_t current_pid = current->pid;
 
     (void)data;
     if (!regs)
         return;
 
-    memset(path, 0, sizeof(path));
+    /* Build the record on the stack, outside the lock. Zeroing it first
+     * means no stale bytes from an older record ever reach userspace. */
+    memset(&ev, 0, sizeof(ev));
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
     syscall_get_arguments(current, regs, args);
@@ -93,56 +115,37 @@ static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
     syscall_get_arguments(current, regs, 0, 6, args);
 #endif
 
+    ev.pid = (sm_s32)current->pid;
+    ev.nr = (sm_s32)id;
+    ev.ts_ns = (sm_u64)ktime_get_real_ns();
+    strscpy(ev.comm, current->comm, sizeof(ev.comm));
+
     if (id == SM_NR_OPENAT) {
-        arg_a = (sm_u64)args[0];
-        arg_b = (sm_u64)args[2];
-        if (args[1]) {
-            long res;
-
-            pagefault_disable();
-            res = strncpy_from_user(path, (const char __user *)args[1],
-                                    SM_ARG_STR_LEN - 1);
-            pagefault_enable();
-            if (res < 0)
-                strscpy(path, "[EFAULT]", sizeof(path));
-        }
+        ev.arg_a = (sm_u64)args[0];
+        ev.arg_b = (sm_u64)args[2];
+        sm_copy_user_str(ev.arg_str, args[1]);
     } else if (id == SM_NR_MMAP) {
-        arg_a = (sm_u64)args[0];
-        arg_b = (sm_u64)args[1];
-        strscpy(path, "mmap", sizeof(path));
+        ev.arg_a = (sm_u64)args[0];
+        ev.arg_b = (sm_u64)args[1];
+        strscpy(ev.arg_str, "mmap", sizeof(ev.arg_str));
     } else if (id == SM_NR_EXECVE) {
-        arg_a = (sm_u64)args[1];
-        arg_b = (sm_u64)args[2];
-        if (args[0]) {
-            long res;
-
-            pagefault_disable();
-            res = strncpy_from_user(path, (const char __user *)args[0],
-                                    SM_ARG_STR_LEN - 1);
-            pagefault_enable();
-            if (res < 0)
-                strscpy(path, "[EFAULT]", sizeof(path));
-        }
+        ev.arg_a = (sm_u64)args[1];
+        ev.arg_b = (sm_u64)args[2];
+        sm_copy_user_str(ev.arg_str, args[0]);
     } else {
-        arg_a = (sm_u64)args[0];
-        arg_b = (sm_u64)args[1];
+        ev.arg_a = (sm_u64)args[0];
+        ev.arg_b = (sm_u64)args[1];
     }
 
-    spin_lock_irqsave(&mon_ctx.lock, flags);
-    ev = &mon_ctx.ring[mon_ctx.head];
-    ev->pid = (sm_s32)current_pid;
-    ev->nr = (sm_s32)id;
-    ev->ts_ns = (sm_u64)ktime_get_real_ns();
-    ev->arg_a = arg_a;
-    ev->arg_b = arg_b;
-    strscpy(ev->comm, current->comm, sizeof(ev->comm));
-    memcpy(ev->arg_str, path, SM_ARG_STR_LEN);
-    mon_ctx.head = (mon_ctx.head + 1) & SM_EVENT_RING_MASK;
-    mon_ctx.seq++;
-    spin_unlock_irqrestore(&mon_ctx.lock, flags);
-    wake_up_interruptible(&mon_ctx.waitq);
-}
+    raw_spin_lock_irqsave(&mon_ctx.lock, flags);
+    mon_ctx.ring[mon_ctx.seq & SM_EVENT_RING_MASK] = ev;
+    WRITE_ONCE(mon_ctx.seq, mon_ctx.seq + 1);
+    raw_spin_unlock_irqrestore(&mon_ctx.lock, flags);
 
+    /* Only touch the wait queue lock when a reader is actually waiting. */
+    if (wq_has_sleeper(&mon_ctx.waitq))
+        wake_up_interruptible(&mon_ctx.waitq);
+}
 static long sm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     struct sm_priv *priv = filp->private_data;
@@ -228,7 +231,6 @@ static bool sm_capable(void)
 static int sm_open(struct inode *inode, struct file *filp)
 {
     struct sm_priv *priv;
-    unsigned long flags;
 
     if (!sm_capable())
         return -EPERM;
@@ -247,10 +249,7 @@ static int sm_open(struct inode *inode, struct file *filp)
     priv->exclude_pid = 0;
     priv->n_sys = 0;
 
-    spin_lock_irqsave(&mon_ctx.lock, flags);
-    priv->read_index = mon_ctx.head;
-    priv->last_seq = mon_ctx.seq;
-    spin_unlock_irqrestore(&mon_ctx.lock, flags);
+    priv->next_seq = READ_ONCE(mon_ctx.seq);
 
     filp->private_data = priv;
     /* No seeking. Replaces .llseek = no_llseek, which 6.12 removed. */
@@ -289,61 +288,116 @@ static bool sm_event_wanted(const struct sm_priv *priv, const struct sm_event *e
     return false;
 }
 
+/*
+ * Advance the cursor of a reader lapped by the producer: everything older
+ * than the last SM_EVENT_RING_SIZE records has been overwritten.
+ * Called with mon_ctx.lock held.
+ */
+static void sm_catch_up(struct sm_priv *priv)
+{
+    if (mon_ctx.seq - priv->next_seq > SM_EVENT_RING_SIZE)
+        priv->next_seq = mon_ctx.seq - SM_EVENT_RING_SIZE;
+}
+
+/*
+ * Copy up to max_out wanted records into priv->snap and return how many.
+ * Unwanted records are consumed. Only records that existed on entry are
+ * examined, so the loop is bounded even under a syscall storm, and
+ * mon_ctx.lock is taken once per record so IRQs are never off for long.
+ * Called with priv->lock held.
+ */
+static unsigned int sm_collect(struct sm_priv *priv, unsigned int max_out)
+{
+    unsigned long flags, end = READ_ONCE(mon_ctx.seq);
+    unsigned int n = 0;
+
+    while (n < max_out) {
+        struct sm_event *dst = &priv->snap[n];
+
+        raw_spin_lock_irqsave(&mon_ctx.lock, flags);
+        sm_catch_up(priv);
+        if ((long)(end - priv->next_seq) <= 0) {
+            raw_spin_unlock_irqrestore(&mon_ctx.lock, flags);
+            break;
+        }
+        *dst = mon_ctx.ring[priv->next_seq & SM_EVENT_RING_MASK];
+        priv->next_seq++;
+        raw_spin_unlock_irqrestore(&mon_ctx.lock, flags);
+
+        if (sm_event_wanted(priv, dst))
+            n++;
+    }
+    return n;
+}
+
+/*
+ * True when a record this reader wants is waiting. Unwanted records in
+ * front of it (for example the reader's own poll()/read() syscalls, which
+ * SET_EXCLUDE_PID hides) are skipped, so they no longer make the device
+ * look readable and the reader no longer wakes itself in a loop.
+ * Called with priv->lock held.
+ */
+static bool sm_pending(struct sm_priv *priv)
+{
+    unsigned long flags, end = READ_ONCE(mon_ctx.seq);
+    struct sm_event ev;
+
+    for (;;) {
+        raw_spin_lock_irqsave(&mon_ctx.lock, flags);
+        sm_catch_up(priv);
+        if ((long)(end - priv->next_seq) <= 0) {
+            raw_spin_unlock_irqrestore(&mon_ctx.lock, flags);
+            return false;
+        }
+        ev = mon_ctx.ring[priv->next_seq & SM_EVENT_RING_MASK];
+        raw_spin_unlock_irqrestore(&mon_ctx.lock, flags);
+
+        if (sm_event_wanted(priv, &ev))
+            return true;
+        priv->next_seq++;
+    }
+}
+
 static ssize_t sm_read(struct file *filp, char __user *ubuf, size_t count, loff_t *ppos)
 {
     struct sm_priv *priv = filp->private_data;
-    unsigned long flags;
-    unsigned int local_head, n;
-    size_t n_out, nbytes;
-    int ret = 0;
+    unsigned int max_out, n;
+    unsigned long seen;
+    ssize_t ret;
 
     (void)ppos;
     if (!priv || !priv->snap)
         return -EFAULT;
+    if (count == 0)
+        return 0;
+    /* Checked before anything is consumed, so no record is lost. */
+    if (count < SM_EVENT_SIZE)
+        return -ENOBUFS;
 
-    if (!(filp->f_flags & O_NONBLOCK)) {
-        ret = wait_event_interruptible(mon_ctx.waitq,
-                                       READ_ONCE(mon_ctx.seq) != priv->last_seq);
-        if (ret)
+    max_out = (unsigned int)min_t(size_t, count / SM_EVENT_SIZE, SM_EVENT_RING_SIZE);
+
+    for (;;) {
+        if (mutex_lock_interruptible(&priv->lock))
+            return -ERESTARTSYS;
+        /* Never takes more records than fit in the caller's buffer. */
+        n = sm_collect(priv, max_out);
+        if (n) {
+            size_t nbytes = (size_t)n * SM_EVENT_SIZE;
+
+            ret = copy_to_user(ubuf, priv->snap, nbytes) ? -EFAULT : (ssize_t)nbytes;
+            mutex_unlock(&priv->lock);
             return ret;
-    } else if (READ_ONCE(mon_ctx.seq) == priv->last_seq) {
-        return -EAGAIN;
+        }
+        seen = priv->next_seq;
+        mutex_unlock(&priv->lock);
+
+        /* Nothing wanted: -EAGAIN, or sleep until new records arrive.
+         * Never returns 0, which callers would read as end of file. */
+        if (filp->f_flags & O_NONBLOCK)
+            return -EAGAIN;
+        if (wait_event_interruptible(mon_ctx.waitq, READ_ONCE(mon_ctx.seq) != seen))
+            return -ERESTARTSYS;
     }
-
-    if (mutex_lock_interruptible(&priv->lock))
-        return -ERESTARTSYS;
-
-    spin_lock_irqsave(&mon_ctx.lock, flags);
-    local_head = mon_ctx.head;
-
-    /* Slow reader lapped by a full ring: drop history, keep last N-1. */
-    if (mon_ctx.seq - priv->last_seq >= SM_EVENT_RING_SIZE)
-        priv->read_index = (local_head - (SM_EVENT_RING_SIZE - 1)) & SM_EVENT_RING_MASK;
-
-    priv->last_seq = mon_ctx.seq;
-    n = 0;
-    while (priv->read_index != local_head && n < SM_EVENT_RING_SIZE) {
-        const struct sm_event *src = &mon_ctx.ring[priv->read_index];
-
-        priv->read_index = (priv->read_index + 1) & SM_EVENT_RING_MASK;
-        if (!sm_event_wanted(priv, src))
-            continue;
-        priv->snap[n++] = *src;
-    }
-    spin_unlock_irqrestore(&mon_ctx.lock, flags);
-
-    n_out = count / SM_EVENT_SIZE;
-    if (n_out > n)
-        n_out = n;
-    nbytes = n_out * SM_EVENT_SIZE;
-
-    if (nbytes == 0 && count > 0 && n > 0)
-        ret = -ENOBUFS;
-    else if (nbytes > 0 && copy_to_user(ubuf, priv->snap, nbytes))
-        ret = -EFAULT;
-    mutex_unlock(&priv->lock);
-
-    return ret ? ret : (ssize_t)nbytes;
 }
 
 static __poll_t sm_poll(struct file *filp, poll_table *wait)
@@ -352,11 +406,14 @@ static __poll_t sm_poll(struct file *filp, poll_table *wait)
     __poll_t mask = 0;
 
     poll_wait(filp, &mon_ctx.waitq, wait);
-    if (priv && READ_ONCE(mon_ctx.seq) != priv->last_seq)
+    if (!priv)
+        return EPOLLERR;
+    mutex_lock(&priv->lock);
+    if (sm_pending(priv))
         mask |= EPOLLIN | EPOLLRDNORM;
+    mutex_unlock(&priv->lock);
     return mask;
 }
-
 static const struct file_operations sm_fops = {
     .owner          = THIS_MODULE,
     .open           = sm_open,
@@ -370,9 +427,8 @@ static int __init syscall_monitor_init(void)
 {
     int ret;
 
-    spin_lock_init(&mon_ctx.lock);
+    raw_spin_lock_init(&mon_ctx.lock);
     init_waitqueue_head(&mon_ctx.waitq);
-    mon_ctx.head = 0;
     mon_ctx.seq = 0;
 
     ret = alloc_chrdev_region(&mon_ctx.dev_num, 0, 1, DEVICE_NAME);
