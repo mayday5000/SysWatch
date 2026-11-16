@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/utsname.h>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -194,17 +195,36 @@ static bool decode_events(std::span<const uint8_t> buf, int (*fn)(const sm_event
     return true;
 }
 
+// True for a 32-bit TUI on a 64-bit kernel. The generated name table is
+// for the ABI the TUI was compiled for, so it names compat records then,
+// and native records otherwise.
+static bool tui_is_compat_abi() {
+    static const bool v = [] {
+        if (sizeof(void *) != 4) return false;
+        utsname u{};
+        return ::uname(&u) == 0 && std::strstr(u.machine, "64") != nullptr;
+    }();
+    return v;
+}
+
+static std::string display_syscall_name(int32_t nr, bool compat) {
+    if (compat == tui_is_compat_abi())
+        return syscall_name(nr);
+    return (compat ? "compat_" : "native_") + std::to_string(nr);
+}
+
 static int on_raw_kernel_event(const sm_event &raw, void *user_data) {
     auto *ctx = static_cast<EventLoopContext*>(user_data);
     
     UiEvent e;
     e.pid = raw.pid;
-    e.nr = raw.nr;
+    e.compat = (raw.nr & SM_NR_COMPAT) != 0;
+    e.nr = raw.nr & ~SM_NR_COMPAT;
     e.ts_ns = raw.ts_ns;
     // comm and the path argument are attacker-controlled; never let them
     // reach the terminal (or the capture file) as raw control bytes.
     e.comm = sanitize_terminal(std::string_view(raw.comm, strnlen(raw.comm, SM_COMM_LEN)));
-    e.sys_name = syscall_name(raw.nr);
+    e.sys_name = display_syscall_name(e.nr, e.compat);
     e.extra = sanitize_terminal(std::string_view(raw.arg_str, strnlen(raw.arg_str, SM_ARG_STR_LEN)));
 
     if (ctx->filters->hidden(e.comm, e.pid, e.nr, e.sys_name)) {

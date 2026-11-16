@@ -51,6 +51,15 @@ typedef uint64_t sm_u64;
 #define DEL_FILTER_SYSCALL      _IOW(SM_IOC_MAGIC, 6, sm_s32)
 #define SM_MAX_NR_FILTERS       (64)
 
+/*
+ * Set in sm_event.nr for a syscall made by a 32-bit (compat) task on a
+ * 64-bit kernel, for example an i386 binary on x86_64. The low bits are
+ * then the compat syscall number (i386 openat is 295, not 257), and
+ * arg_str is not decoded because the number does not mean the same call.
+ * SET/ADD/DEL_FILTER_SYSCALL compare the full value, flag included.
+ */
+#define SM_NR_COMPAT            (0x40000000)
+
 #define SM_COMM_LEN             (16)
 #define SM_ARG_STR_LEN          (128)
 #define SM_EVENT_RING_SIZE      (512)

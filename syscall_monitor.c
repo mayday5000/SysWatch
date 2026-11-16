@@ -17,6 +17,7 @@
 #include <linux/string.h>
 #include <linux/capability.h>
 #include <linux/mutex.h>
+#include <linux/compat.h>
 #include <asm/syscall.h>
 
 #include "syscall_monitor_shared.h"
@@ -120,7 +121,13 @@ static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
     ev.ts_ns = (sm_u64)ktime_get_real_ns();
     strscpy(ev.comm, current->comm, sizeof(ev.comm));
 
-    if (id == SM_NR_OPENAT) {
+    if (in_compat_syscall()) {
+        /* 32-bit task on a 64-bit kernel: id is a compat number, so the
+         * native SM_NR_* tests below would decode the wrong syscalls. */
+        ev.nr = (sm_s32)((u32)id | SM_NR_COMPAT);
+        ev.arg_a = (sm_u64)args[0];
+        ev.arg_b = (sm_u64)args[1];
+    } else if (id == SM_NR_OPENAT) {
         ev.arg_a = (sm_u64)args[0];
         ev.arg_b = (sm_u64)args[2];
         sm_copy_user_str(ev.arg_str, args[1]);
@@ -227,6 +234,15 @@ static bool sm_capable(void)
     return capable(CAP_SYS_ADMIN);
 #endif
 }
+
+#ifdef CONFIG_COMPAT
+/* Every ioctl takes a pointer to an sm_s32, which has the same layout for
+ * 32-bit callers, so only the pointer needs converting. */
+static long sm_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    return sm_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
 
 static int sm_open(struct inode *inode, struct file *filp)
 {
@@ -421,6 +437,9 @@ static const struct file_operations sm_fops = {
     .read           = sm_read,
     .poll           = sm_poll,
     .unlocked_ioctl = sm_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl   = sm_compat_ioctl,
+#endif
 };
 
 static int __init syscall_monitor_init(void)

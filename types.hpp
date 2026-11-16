@@ -7,6 +7,7 @@ struct UiEvent {
     int32_t pid = 0;
     int32_t nr = 0;
     uint64_t ts_ns = 0;
+    bool compat = false;   // 32-bit task on a 64-bit kernel (SM_NR_COMPAT)
     std::string comm;
     std::string sys_name;
     std::string extra;
