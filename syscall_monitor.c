@@ -16,6 +16,7 @@
 #include <linux/ktime.h>
 #include <linux/string.h>
 #include <linux/capability.h>
+#include <linux/mutex.h>
 #include <asm/syscall.h>
 
 #include "syscall_monitor_shared.h"
@@ -36,7 +37,13 @@ MODULE_VERSION("1.1");
 #define DEVICE_NAME      "syscall_monitor"
 #define CLASS_NAME       "syscall_mon"
 
+/*
+ * Per-open state. lock serialises ioctl() and read() on the same file
+ * (threads or a dup()ed/inherited fd): it guards the filters, the read
+ * cursor and snap, so n_sys can never exceed SM_MAX_NR_FILTERS.
+ */
 struct sm_priv {
+    struct mutex lock;
     unsigned int read_index;
     unsigned long last_seq;
     struct sm_event *snap;
@@ -139,31 +146,41 @@ static void probe_sys_enter(void *data, struct pt_regs *regs, long id)
 static long sm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     struct sm_priv *priv = filp->private_data;
-    sm_s32 val32;
+    sm_s32 val32 = 0;
 
     if (!priv)
         return -EFAULT;
 
     switch (cmd) {
     case SET_FILTER_PID:
+    case SET_EXCLUDE_PID:
+    case SET_FILTER_SYSCALL:
+    case ADD_FILTER_SYSCALL:
+    case DEL_FILTER_SYSCALL:
         if (copy_from_user(&val32, (sm_s32 __user *)arg, sizeof(val32)))
             return -EFAULT;
+        break;
+    case CLEAR_FILTERS:
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    if (mutex_lock_interruptible(&priv->lock))
+        return -ERESTARTSYS;
+
+    switch (cmd) {
+    case SET_FILTER_PID:
         WRITE_ONCE(priv->filter_pid, (pid_t)val32);
         break;
     case SET_EXCLUDE_PID:
-        if (copy_from_user(&val32, (sm_s32 __user *)arg, sizeof(val32)))
-            return -EFAULT;
         WRITE_ONCE(priv->exclude_pid, (pid_t)val32);
         break;
     case SET_FILTER_SYSCALL:
-        if (copy_from_user(&val32, (sm_s32 __user *)arg, sizeof(val32)))
-            return -EFAULT;
         priv->sys_ids[0] = val32;
         priv->n_sys = 1;
         break;
     case ADD_FILTER_SYSCALL:
-        if (copy_from_user(&val32, (sm_s32 __user *)arg, sizeof(val32)))
-            return -EFAULT;
         {
             int i, found = 0;
             for (i = 0; i < priv->n_sys; i++) {
@@ -175,8 +192,6 @@ static long sm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         }
         break;
     case DEL_FILTER_SYSCALL:
-        if (copy_from_user(&val32, (sm_s32 __user *)arg, sizeof(val32)))
-            return -EFAULT;
         {
             int i, j = 0;
             for (i = 0; i < priv->n_sys; i++) {
@@ -191,9 +206,8 @@ static long sm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         WRITE_ONCE(priv->exclude_pid, 0);
         priv->n_sys = 0;
         break;
-    default:
-        return -EINVAL;
     }
+    mutex_unlock(&priv->lock);
     return 0;
 }
 
@@ -228,6 +242,7 @@ static int sm_open(struct inode *inode, struct file *filp)
         return -ENOMEM;
     }
 
+    mutex_init(&priv->lock);
     priv->filter_pid = 0;
     priv->exclude_pid = 0;
     priv->n_sys = 0;
@@ -248,6 +263,7 @@ static int sm_release(struct inode *inode, struct file *filp)
 
     (void)inode;
     if (priv) {
+        mutex_destroy(&priv->lock);
         kfree(priv->snap);
         kfree(priv);
     }
@@ -294,6 +310,9 @@ static ssize_t sm_read(struct file *filp, char __user *ubuf, size_t count, loff_
         return -EAGAIN;
     }
 
+    if (mutex_lock_interruptible(&priv->lock))
+        return -ERESTARTSYS;
+
     spin_lock_irqsave(&mon_ctx.lock, flags);
     local_head = mon_ctx.head;
 
@@ -319,11 +338,12 @@ static ssize_t sm_read(struct file *filp, char __user *ubuf, size_t count, loff_
     nbytes = n_out * SM_EVENT_SIZE;
 
     if (nbytes == 0 && count > 0 && n > 0)
-        return -ENOBUFS;
-    if (nbytes > 0 && copy_to_user(ubuf, priv->snap, nbytes))
-        return -EFAULT;
+        ret = -ENOBUFS;
+    else if (nbytes > 0 && copy_to_user(ubuf, priv->snap, nbytes))
+        ret = -EFAULT;
+    mutex_unlock(&priv->lock);
 
-    return (ssize_t)nbytes;
+    return ret ? ret : (ssize_t)nbytes;
 }
 
 static __poll_t sm_poll(struct file *filp, poll_table *wait)
