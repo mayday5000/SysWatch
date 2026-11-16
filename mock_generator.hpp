@@ -70,8 +70,6 @@ private:
         };
         std::uniform_int_distribution<size_t> arg_dist(0, args.size() - 1);
 
-        uint64_t fake_timestamp = 1000000000;
-
         while (running_) {
             // Adjust loop sleep interval to regulate background event traffic throughput (e.g., ~15ms)
             std::this_thread::sleep_for(std::chrono::milliseconds(15));
@@ -79,7 +77,9 @@ private:
             sm_event ev{};
             ev.pid = pid_dist(gen);
             ev.nr = nr_dist(gen);
-            ev.ts_ns = fake_timestamp += 15000000; // Increment mock nanoseconds cleanly
+            // Wall-clock nanoseconds, like ktime_get_real_ns() in the module.
+            ev.ts_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
             ev.arg_a = 0xDEADBEEF;
             ev.arg_b = 0xCAFEBABE;
 

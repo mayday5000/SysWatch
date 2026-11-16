@@ -68,7 +68,8 @@ namespace tui {
     void style_highlight();
     void style_reset();
     
-    void render_dashboard(const IView &view, const IFilterStore &filters, int32_t fpid, const UiState &state);
+    // Clamps the overlay cursor in state and tells the view its height.
+    void render_dashboard(IView &view, const IFilterStore &filters, int32_t fpid, UiState &state);
     int32_t clamp_refresh_ms(int32_t ms);
     bool refresh_due(int64_t now_ms, int64_t last_ms, bool dirty, int64_t interval_ms);
 }

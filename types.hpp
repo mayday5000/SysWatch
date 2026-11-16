@@ -22,9 +22,11 @@ enum class Sort : int32_t {
     Param = 3
 };
 
+// Values above 0xff so no byte read from the terminal (Ctrl-A is 1,
+// Ctrl-H is 8, ...) can be mistaken for a navigation key.
 enum class Key : int32_t {
-    Up = 1, Down = 2, PgUp = 3, PgDn = 4,
-    Pause = 5, Follow = 6, Home = 7, End = 8
+    Up = 0x101, Down = 0x102, PgUp = 0x103, PgDn = 0x104,
+    Pause = 0x105, Follow = 0x106, Home = 0x107, End = 0x108
 };
 
 class IView {

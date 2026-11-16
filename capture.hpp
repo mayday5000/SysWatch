@@ -13,6 +13,8 @@ public:
     bool toggle();
     bool active() const { return static_cast<bool>(file_); }
     void write(const UiEvent &e);
+    // Called once per batch of records rather than per record.
+    void flush() { if (file_) std::fflush(file_.get()); }
 private:
     struct Close { void operator()(FILE *f) const { if (f) std::fclose(f); } };
     std::unique_ptr<FILE, Close> file_;

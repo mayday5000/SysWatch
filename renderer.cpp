@@ -217,16 +217,17 @@ static void render_core_trace_records(const IView &view, int32_t body, int32_t s
             if (e) {
                 int32_t extra_w = (screen_cols > 78) ? (screen_cols - 78) : 10;
                 
-                uint64_t total_msec = e->ts_ns / 1'000'000;
-                uint32_t msec    = static_cast<uint32_t>(total_msec % 1000);
-                uint64_t total_s = total_msec / 1000;
-                uint32_t sec     = static_cast<uint32_t>(total_s % 60);
-                uint32_t min     = static_cast<uint32_t>((total_s / 60) % 60);
-                uint32_t hour    = static_cast<uint32_t>((total_s / 3600) % 24);
+                // ts_ns is wall-clock time (ktime_get_real_ns); show it in
+                // local time, like the clock in the title bar.
+                const time_t secs = static_cast<time_t>(e->ts_ns / 1'000'000'000ULL);
+                const uint32_t msec = static_cast<uint32_t>((e->ts_ns / 1'000'000ULL) % 1000);
+                std::tm ltm{};
+                if (!localtime_r(&secs, &ltm)) ltm = std::tm{};
 
                 std::string time_stamp_str;
                 time_stamp_str.resize(16);
-                std::snprintf(time_stamp_str.data(), time_stamp_str.size(), "%02u:%02u:%02u.%03u", hour, min, sec, msec);
+                std::snprintf(time_stamp_str.data(), time_stamp_str.size(), "%02d:%02d:%02d.%03u",
+                              ltm.tm_hour, ltm.tm_min, ltm.tm_sec, msec);
 
                 int32_t line_size = std::snprintf(nullptr, 0, "%c %-21.21s | %-6d | %-16.16s | %-6d | %-12.12s | %.*s",
                                                   (abs_idx == view.sel()) ? '*' : ' ', time_stamp_str.c_str(),
@@ -317,7 +318,7 @@ static void render_interactive_footer_dock(int32_t body, int32_t screen_cols, co
     std::fwrite(ansi::style_reset.data(), 1, ansi::style_reset.size(), stdout);
 }
 
-static void render_right_side_modal_overlays(const IFilterStore &filters, int32_t body, int32_t screen_cols, const UiState &state) {
+static void render_right_side_modal_overlays(const IFilterStore &filters, int32_t body, int32_t screen_cols, UiState &state) {
     int32_t x_pos = (screen_cols > 44) ? (screen_cols - 40) : 2;
     
     std::vector<std::string> labels;
@@ -364,7 +365,7 @@ static void render_right_side_modal_overlays(const IFilterStore &filters, int32_
     int32_t n = static_cast<int32_t>(labels.size());
     int32_t vis = (body > 4) ? (body - 2) : 4;
     
-    UiState& mutable_state = const_cast<UiState&>(state);
+    UiState& mutable_state = state;
     
     // Anti-Flicker Switch: Lock scrolling bounds to row 0 if inside the rate rate text-modifier
     if (state.overlay != OverlayMode::EditRefreshMs) {
@@ -428,7 +429,7 @@ static void render_right_side_modal_overlays(const IFilterStore &filters, int32_
 // Main Orchestrator Definition
 // =================================================================------------
 
-void render_dashboard(const IView &view, const IFilterStore &filters, int32_t fpid, const UiState &state) {
+void render_dashboard(IView &view, const IFilterStore &filters, int32_t fpid, UiState &state) {
     struct winsize w{};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1 || w.ws_row == 0 || w.ws_col == 0) {
         return; // Guard backdrop structures if window dimensions are completely lost
@@ -437,7 +438,7 @@ void render_dashboard(const IView &view, const IFilterStore &filters, int32_t fp
     const int32_t screen_rows = w.ws_row;
     const int32_t screen_cols = w.ws_col;
     const int32_t body = (screen_rows > 5) ? (screen_rows - 5) : 3;
-    const_cast<IView&>(view).set_rows(body);
+    view.set_rows(body);
 
     // Route A: Full-Screen 'lsof' Process Details Viewer Mode
     if (state.overlay == OverlayMode::InspectLsof) {
@@ -447,7 +448,7 @@ void render_dashboard(const IView &view, const IFilterStore &filters, int32_t fp
         render_core_trace_records(view, body, screen_cols, state);
         render_interactive_footer_dock(body, screen_cols, state);
         std::fflush(stdout);
-        const_cast<IView&>(view).mark_drawn();
+        view.mark_drawn();
         return;
     }
 
@@ -455,7 +456,7 @@ void render_dashboard(const IView &view, const IFilterStore &filters, int32_t fp
     if (state.overlay != OverlayMode::None) {
         render_right_side_modal_overlays(filters, body, screen_cols, state);
         std::fflush(stdout);
-        const_cast<IView&>(view).mark_drawn();
+        view.mark_drawn();
         return;
     }
 
@@ -467,7 +468,7 @@ void render_dashboard(const IView &view, const IFilterStore &filters, int32_t fp
     render_interactive_footer_dock(body, screen_cols, state);
 
     std::fflush(stdout);
-    const_cast<IView&>(view).mark_drawn();
+    view.mark_drawn();
 }
 
 } // namespace tui

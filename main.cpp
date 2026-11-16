@@ -22,6 +22,8 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
+#include <spawn.h>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -35,10 +37,12 @@
 #include <array>
 #include <algorithm>
 #include <cstdio>
+#include <charconv>
 #include <expected>
 #include <functional>
 #include <map>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -150,34 +154,63 @@ static void install() {
 // Input parser
 // ==========================================
 
+// Reads one key. Plain bytes come back as themselves (0..255); arrows,
+// Home/End and PgUp/PgDn come back as Key values (all above 0xff). A lone
+// ESC is told apart from the start of a sequence by waiting briefly for
+// the rest, so a slow link does not turn an arrow into ESC + '[' + 'A'.
 static int read_key() {
     unsigned char b = 0;
     ssize_t n = ::read(STDIN_FILENO, &b, sizeof(b));
     if (n <= 0) return 0;
     if (b != 0x1b) return b;
-    
-    std::array<unsigned char, 3> seq{};
-    ssize_t n2 = ::read(STDIN_FILENO, seq.data(), seq.size());
-    
-    if (n2 >= 2 && seq[0] == '[') {
-        if (seq[1] == 'A') return std::to_underlying(Key::Up);
-        if (seq[1] == 'B') return std::to_underlying(Key::Down);
-        if (seq[1] == 'H') return std::to_underlying(Key::Home);
-        if (seq[1] == 'F') return std::to_underlying(Key::End);
-        
-        if (n2 >= 3 && seq[2] == '~') {
-            if (seq[1] == '5') return std::to_underlying(Key::PgUp);
-            if (seq[1] == '6') return std::to_underlying(Key::PgDn);
-        }
+
+    std::array<unsigned char, 8> seq{};
+    size_t len = 0;
+    while (len < seq.size()) {
+        pollfd pf{STDIN_FILENO, POLLIN, 0};
+        if (::poll(&pf, 1, len == 0 ? 50 : 10) <= 0) break;
+        if (::read(STDIN_FILENO, &seq[len], 1) != 1) break;
+        unsigned char c = seq[len++];
+        // A CSI/SS3 sequence ends with a byte in 0x40..0x7e (after the
+        // introducer itself).
+        if (len >= 2 && c >= 0x40 && c <= 0x7e) break;
+        if (len == 1 && c != '[' && c != 'O') break;
     }
-    return 0x1b; 
+    if (len < 2 || (seq[0] != '[' && seq[0] != 'O'))
+        return 0x1b;
+
+    const std::string_view s(reinterpret_cast<const char *>(seq.data() + 1), len - 1);
+    if (s == "A") return std::to_underlying(Key::Up);
+    if (s == "B") return std::to_underlying(Key::Down);
+    if (s == "H" || s == "1~" || s == "7~") return std::to_underlying(Key::Home);
+    if (s == "F" || s == "4~" || s == "8~") return std::to_underlying(Key::End);
+    if (s == "5~") return std::to_underlying(Key::PgUp);
+    if (s == "6~") return std::to_underlying(Key::PgDn);
+    return 0; // some other sequence (F-keys, Left/Right, ...): ignore it
 }
+
+// The lsof run behind the L key. Its own syscalls (and those of the
+// helper process lsof forks) would otherwise flood the view, so records
+// from that process, or named "lsof" and inside the run's time window,
+// are dropped.
+struct LsofRun {
+    int32_t pid = 0;
+    uint64_t t0_ns = 0;
+    uint64_t t1_ns = 0;
+};
 
 struct EventLoopContext {
     IFilterStore *filters = nullptr;
     Capture *cap = nullptr;
     IView *view = nullptr;
+    LsofRun *lsof = nullptr;
 };
+
+static bool from_lsof_helper(const LsofRun &run, int32_t pid, std::string_view comm, uint64_t ts) {
+    if (run.pid <= 0) return false;
+    if (pid == run.pid) return true;
+    return comm == "lsof" && ts >= run.t0_ns && ts <= run.t1_ns;
+}
 
 // True for a 32-bit TUI on a 64-bit kernel. The generated name table is
 // for the ABI the TUI was compiled for, so it names compat records then,
@@ -211,6 +244,8 @@ static int on_raw_kernel_event(const sm_event &raw, void *user_data) {
     e.sys_name = display_syscall_name(e.nr, e.compat);
     e.extra = sanitize_terminal(std::string_view(raw.arg_str, strnlen(raw.arg_str, SM_ARG_STR_LEN)));
 
+    if (ctx->lsof && from_lsof_helper(*ctx->lsof, e.pid, e.comm, e.ts_ns))
+        return 0;
     if (ctx->filters->hidden(e.comm, e.pid, e.nr, e.sys_name)) {
         return 0; 
     }
@@ -229,27 +264,79 @@ static void clear_overlay_area(IView &view, tui::UiState &state) {
     view.set_rows(view.count()); 
 }
 
+// lsof is looked up on PATH (plus the usual sbin directories, which a
+// sudo PATH may lack) without starting a shell.
 static bool check_lsof_presence() {
-    if (std::filesystem::exists("/usr/bin/lsof") || 
-        std::filesystem::exists("/bin/lsof") || 
-        std::filesystem::exists("/usr/sbin/lsof")) {
-        return true;
+    std::string path = "/usr/sbin:/sbin";
+    if (const char *p = std::getenv("PATH")) path = std::string(p) + ":" + path;
+    size_t start = 0;
+    while (start <= path.size()) {
+        size_t end = path.find(':', start);
+        if (end == std::string::npos) end = path.size();
+        std::string dir = path.substr(start, end - start);
+        if (dir.empty()) dir = ".";
+        if (::access((dir + "/lsof").c_str(), X_OK) == 0) return true;
+        start = end + 1;
     }
-    
-    FILE* pipe = popen("command -v lsof 2>/dev/null", "r");
-    if (!pipe) return false;
-    std::array<char, 16> buffer{};
-    char* result = fgets(buffer.data(), static_cast<int>(buffer.size()), pipe);
-    pclose(pipe);
-    return (result != nullptr);
+    return false;
 }
 
-static std::string lsof_command(int32_t pid) {
-    if (pid <= 0) return {};
-    return "lsof -n -P -p " + std::to_string(pid);
+static uint64_t wall_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
 }
 
-static void populate_lsof_buffer(const IView &view, tui::UiState &state) {
+// Runs "lsof -n -P -p <pid>" directly (no shell) and returns its output
+// lines. run records the child so its records can be hidden.
+static std::vector<std::string> run_lsof(int32_t pid, LsofRun &run) {
+    std::vector<std::string> lines;
+    int p[2];
+    if (::pipe2(p, O_CLOEXEC) != 0) return lines;
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, p[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+
+    std::string pid_str = std::to_string(pid);
+    char a0[] = "lsof", a1[] = "-n", a2[] = "-P", a3[] = "-p";
+    char *argv[] = {a0, a1, a2, a3, pid_str.data(), nullptr};
+    extern char **environ;
+    pid_t child = -1;
+    run.t0_ns = wall_ns();
+    int err = posix_spawnp(&child, "lsof", &fa, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    ::close(p[1]);
+    if (err != 0) { ::close(p[0]); return lines; }
+    run.pid = static_cast<int32_t>(child);
+
+    std::string buf;
+    std::array<char, 4096> chunk{};
+    ssize_t n;
+    while ((n = ::read(p[0], chunk.data(), chunk.size())) != 0) {
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        buf.append(chunk.data(), static_cast<size_t>(n));
+    }
+    ::close(p[0]);
+    int st = 0;
+    while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {}
+    run.t1_ns = wall_ns();
+
+    size_t start = 0;
+    while (start < buf.size()) {
+        size_t end = buf.find('\n', start);
+        if (end == std::string::npos) end = buf.size();
+        std::string line = buf.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) lines.push_back(sanitize_terminal(line));
+        start = end + 1;
+    }
+    return lines;
+}
+
+static void populate_lsof_buffer(const IView &view, tui::UiState &state, LsofRun &run) {
     const UiEvent *selected = nullptr;
     for (int32_t i = 0; i < view.count(); ++i) {
         if (view.top() + i == view.sel()) {
@@ -263,18 +350,7 @@ static void populate_lsof_buffer(const IView &view, tui::UiState &state) {
     state.lsof_sel = 0;
     state.lsof_top = 0;
 
-    std::string cmd = lsof_command(selected->pid) + " 2>/dev/null";
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return;
-
-    std::array<char, 512> chunk{};
-    while (fgets(chunk.data(), static_cast<int>(chunk.size()), pipe)) {
-        std::string line(chunk.data());
-        if (!line.empty() && line.back() == '\n') line.pop_back();
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) state.lsof_lines.push_back(sanitize_terminal(line));
-    }
-    pclose(pipe);
+    state.lsof_lines = run_lsof(selected->pid, run);
 
     if (!state.lsof_lines.empty()) {
         state.overlay = tui::OverlayMode::InspectLsof;
@@ -515,28 +591,36 @@ static void handle_active_overlay_input(int key, IView &view, IFilterStore &filt
     }
 }
 
-using DashFn = std::function<void(IView &, Capture &, tui::UiState &)>;
+using DashFn = std::function<void(IView &, Capture &, tui::UiState &, LsofRun &)>;
 
 static const std::map<int, DashFn> kDashMap = {
-    {'f', [](IView &, Capture &, tui::UiState &state) { state.overlay = tui::OverlayMode::MainFilterHub; state.overlay_sel = 0; }},
-    {'F', [](IView &, Capture &, tui::UiState &state) { state.overlay = tui::OverlayMode::MainFilterHub; state.overlay_sel = 0; }},
-    {'s', [](IView &, Capture &, tui::UiState &state) { state.overlay = tui::OverlayMode::SelectSort; state.overlay_sel = 0; }},
-    {'S', [](IView &, Capture &, tui::UiState &state) { state.overlay = tui::OverlayMode::SelectSort; state.overlay_sel = 0; }},
-    {'o', [](IView &, Capture &, tui::UiState &state) { state.overlay = tui::OverlayMode::SelectOrder; state.overlay_sel = 0; }},
-    {'O', [](IView &, Capture &, tui::UiState &state) { state.overlay = tui::OverlayMode::SelectOrder; state.overlay_sel = 0; }},
-    {'r', [](IView &, Capture &, tui::UiState &state) { state.overlay = tui::OverlayMode::EditRefreshMs; state.refresh_edit = state.refresh_ms; state.overlay_sel = 0; }},
-    {'R', [](IView &, Capture &, tui::UiState &state) { state.overlay = tui::OverlayMode::EditRefreshMs; state.refresh_edit = state.refresh_ms; state.overlay_sel = 0; }},
-    {'l', [](IView &view, Capture &, tui::UiState &state) { if (state.has_lsof) populate_lsof_buffer(view, state); }},
-    {'L', [](IView &view, Capture &, tui::UiState &state) { if (state.has_lsof) populate_lsof_buffer(view, state); }},
-    {' ', [](IView &view, Capture &, tui::UiState &) { view.on_key(Key::Pause); }},
-    {'c', [](IView &, Capture &cap, tui::UiState &state) { cap.toggle(); state.is_capturing = cap.active(); }},
-    {'C', [](IView &, Capture &cap, tui::UiState &state) { cap.toggle(); state.is_capturing = cap.active(); }}
+    {'f', [](IView &, Capture &, tui::UiState &state, LsofRun &) { state.overlay = tui::OverlayMode::MainFilterHub; state.overlay_sel = 0; }},
+    {'F', [](IView &, Capture &, tui::UiState &state, LsofRun &) { state.overlay = tui::OverlayMode::MainFilterHub; state.overlay_sel = 0; }},
+    {'s', [](IView &, Capture &, tui::UiState &state, LsofRun &) { state.overlay = tui::OverlayMode::SelectSort; state.overlay_sel = 0; }},
+    {'S', [](IView &, Capture &, tui::UiState &state, LsofRun &) { state.overlay = tui::OverlayMode::SelectSort; state.overlay_sel = 0; }},
+    {'o', [](IView &, Capture &, tui::UiState &state, LsofRun &) { state.overlay = tui::OverlayMode::SelectOrder; state.overlay_sel = 0; }},
+    {'O', [](IView &, Capture &, tui::UiState &state, LsofRun &) { state.overlay = tui::OverlayMode::SelectOrder; state.overlay_sel = 0; }},
+    {'r', [](IView &, Capture &, tui::UiState &state, LsofRun &) { state.overlay = tui::OverlayMode::EditRefreshMs; state.refresh_edit = state.refresh_ms; state.overlay_sel = 0; }},
+    {'R', [](IView &, Capture &, tui::UiState &state, LsofRun &) { state.overlay = tui::OverlayMode::EditRefreshMs; state.refresh_edit = state.refresh_ms; state.overlay_sel = 0; }},
+    {'l', [](IView &view, Capture &, tui::UiState &state, LsofRun &run) { if (state.has_lsof) populate_lsof_buffer(view, state, run); }},
+    {'L', [](IView &view, Capture &, tui::UiState &state, LsofRun &run) { if (state.has_lsof) populate_lsof_buffer(view, state, run); }},
+    {' ', [](IView &view, Capture &, tui::UiState &, LsofRun &) { view.on_key(Key::Pause); }},
+    {'c', [](IView &, Capture &cap, tui::UiState &state, LsofRun &) { cap.toggle(); state.is_capturing = cap.active(); }},
+    {'C', [](IView &, Capture &cap, tui::UiState &state, LsofRun &) { cap.toggle(); state.is_capturing = cap.active(); }}
 };
 
-static void handle_standard_dashboard_input(int key, IView &view, Capture &cap, tui::UiState &state) {
+static void handle_standard_dashboard_input(int key, IView &view, Capture &cap, tui::UiState &state, LsofRun &run) {
     auto it = kDashMap.find(key);
-    if (it != kDashMap.end()) { it->second(view, cap, state); return; }
-    view.on_key(static_cast<Key>(key));
+    if (it != kDashMap.end()) { it->second(view, cap, state, run); return; }
+    // Only navigation keys go to the view; anything else is ignored.
+    switch (static_cast<Key>(key)) {
+        case Key::Up: case Key::Down: case Key::PgUp: case Key::PgDn:
+        case Key::Home: case Key::End:
+            view.on_key(static_cast<Key>(key));
+            break;
+        default:
+            break;
+    }
 }
 
 // Both sources hand the main loop a pollable fd that yields whole 176-byte
@@ -549,9 +633,11 @@ public:
         const int src = fd();
         if (src < 0) return;
         ssize_t n = ::read(src, buf_.data(), buf_.size());
-        if (n > 0)
+        if (n > 0) {
             decode_events(std::span<const uint8_t>(buf_.data(), static_cast<size_t>(n)),
                           on_raw_kernel_event, &ctx);
+            if (ctx.cap) ctx.cap->flush();
+        }
     }
 private:
     // Allocated once, sized for a full ring, reused for every read.
@@ -575,15 +661,40 @@ private:
     MockEventGenerator mock_;
 };
 
+static void usage(std::FILE *out, const char *prog) {
+    std::fprintf(out,
+        "SysWatch " SYSWATCH_VERSION " - syscall monitor TUI\n"
+        "usage: %s [-p PID] [-f FILE] [-h]\n"
+        "  -p PID   show only syscalls from process PID\n"
+        "  -f FILE  filter rules file (default: ./filters.xml)\n"
+        "  -h       show this help\n"
+        "Reading /dev/syscall_monitor needs root, CAP_PERFMON or CAP_SYS_ADMIN;\n"
+        "without the device the TUI runs on simulated events.\n", prog);
+}
+
+// Runs before the terminal is switched to raw mode, so exiting here is safe.
 static int32_t parse_args(int argc, char **argv, std::string &filters_path) {
     int32_t fpid = 0;
+    const char *prog = argc > 0 ? argv[0] : "syswatch";
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc)
-            fpid = static_cast<int32_t>(std::strtol(argv[++i], nullptr, 10));
-        else if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc)
+        const std::string_view a = argv[i];
+        if (a == "-h" || a == "--help") {
+            usage(stdout, prog);
+            std::exit(0);
+        } else if (a == "-p" && i + 1 < argc) {
+            const std::string_view v = argv[++i];
+            auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), fpid);
+            if (ec != std::errc{} || end != v.data() + v.size() || fpid <= 0) {
+                std::fprintf(stderr, "%s: -p needs a positive process ID, got '%s'\n", prog, argv[i]);
+                std::exit(2);
+            }
+        } else if (a == "-f" && i + 1 < argc) {
             filters_path = argv[++i];
-        else if (std::strcmp(argv[i], "-h") == 0)
+        } else {
+            std::fprintf(stderr, "%s: unknown or incomplete option '%s'\n", prog, argv[i]);
+            usage(stderr, prog);
             std::exit(2);
+        }
     }
     return fpid;
 }
@@ -606,10 +717,15 @@ static std::expected<std::unique_ptr<Fd>, int> open_device(int32_t fpid) {
         return std::unexpected(err);
     }
     sm_s32 self = static_cast<sm_s32>(::getpid());
-    ioctl(dev->get(), SET_EXCLUDE_PID, &self);
+    if (ioctl(dev->get(), SET_EXCLUDE_PID, &self) != 0)
+        std::cerr << "syswatch: SET_EXCLUDE_PID failed (" << std::strerror(errno)
+                  << "); the TUI's own syscalls will show up\n";
     if (fpid) {
         sm_s32 id = fpid;
-        ioctl(dev->get(), SET_FILTER_PID, &id);
+        // Showing every process when one was asked for would be wrong.
+        if (ioctl(dev->get(), SET_FILTER_PID, &id) != 0)
+            throw std::runtime_error("SET_FILTER_PID " + std::to_string(fpid) +
+                                     " failed: " + std::strerror(errno));
     }
     return dev;
 }
@@ -636,7 +752,7 @@ public:
         load_syscall_names(state_);
         view_ = std::make_unique<View>(20);
         term_ = std::make_unique<Terminal>();
-        ctx_ = EventLoopContext{filters_.get(), &cap_, view_.get()};
+        ctx_ = EventLoopContext{filters_.get(), &cap_, view_.get(), &lsof_};
         if (dev_) source_ = std::make_unique<DeviceSource>(*dev_);
         else      source_ = std::make_unique<SimulatorSource>();
 
@@ -683,7 +799,7 @@ public:
                 if (state_.overlay != tui::OverlayMode::None)
                     handle_active_overlay_input(key, *view_, *filters_, state_);
                 else
-                    handle_standard_dashboard_input(key, *view_, cap_, state_);
+                    handle_standard_dashboard_input(key, *view_, cap_, state_, lsof_);
                 tui::render_dashboard(*view_, *filters_, fpid_, state_);
                 view_->mark_drawn();
                 last_draw = now_ms();
@@ -712,6 +828,7 @@ private:
     std::unique_ptr<View> view_;
     std::unique_ptr<Terminal> term_;
     Capture cap_;
+    LsofRun lsof_;
     EventLoopContext ctx_{};
     // Declared last so it is destroyed first.
     std::unique_ptr<EventSource> source_;

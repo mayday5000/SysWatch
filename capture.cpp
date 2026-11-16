@@ -61,5 +61,4 @@ void Capture::write(const UiEvent &e) {
                  quote_pipe(std::to_string(e.ts_ns)).c_str(), e.pid,
                  quote_pipe(e.comm).c_str(), e.nr,
                  quote_pipe(e.sys_name).c_str(), quote_pipe(e.extra).c_str());
-    std::fflush(file_.get());
 }
