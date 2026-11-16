@@ -16,6 +16,8 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <termios.h>
+#include <csignal>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <cerrno>
@@ -27,6 +29,7 @@
 #include <ctime>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <array>
 #include <algorithm>
 #include <cstdio>
@@ -73,19 +76,29 @@ private:
 class Terminal {
 public:
     Terminal() {
-        if (tcgetattr(STDIN_FILENO, &orig_) == 0) {
+        ok_ = tcgetattr(STDIN_FILENO, &orig_) == 0;
+        enter();
+    }
+    
+    ~Terminal() { leave(); }
+
+    // Raw-ish mode (no echo, no line buffering) plus the alternate screen.
+    // ISIG stays on, so Ctrl-C / Ctrl-\ / Ctrl-Z arrive as signals that the
+    // main loop handles (see namespace sig).
+    void enter() {
+        if (ok_) {
             termios t = orig_;
             t.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
             t.c_cc[VMIN] = 0;
             t.c_cc[VTIME] = 0;
             tcsetattr(STDIN_FILENO, TCSANOW, &t);
-            ok_ = true;
         }
         std::fwrite(tui::ansi::enter_tui_mode.data(), 1, tui::ansi::enter_tui_mode.size(), stdout);
         std::fflush(stdout);
     }
-    
-    ~Terminal() {
+
+    // Restores the terminal exactly as it was found.
+    void leave() {
         if (ok_) {
             tcsetattr(STDIN_FILENO, TCSANOW, &orig_);
         }
@@ -99,6 +112,37 @@ private:
     termios orig_{};
     bool ok_ = false;
 };
+
+// ==========================================
+// Signals
+// ==========================================
+
+// Handlers only set flags; the main loop (whose poll() they interrupt)
+// does the work, so the terminal is always restored by normal code paths.
+namespace sig {
+volatile std::sig_atomic_t g_quit = 0;
+volatile std::sig_atomic_t g_stop = 0;
+volatile std::sig_atomic_t g_winch = 0;
+
+extern "C" void on_quit(int) { g_quit = 1; }
+extern "C" void on_stop(int) { g_stop = 1; }
+extern "C" void on_winch(int) { g_winch = 1; }
+
+static void set(int signo, void (*fn)(int)) {
+    struct sigaction sa{};
+    sa.sa_handler = fn;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;   // no SA_RESTART: poll() must return EINTR
+    sigaction(signo, &sa, nullptr);
+}
+
+static void install() {
+    for (int s : {SIGINT, SIGTERM, SIGHUP, SIGQUIT})
+        set(s, on_quit);
+    set(SIGTSTP, on_stop);
+    set(SIGWINCH, on_winch);
+}
+}
 
 // ==========================================
 // Input parser
@@ -590,6 +634,8 @@ public:
         if (dev_) source_ = std::make_unique<DeviceSource>(*dev_);
         else      source_ = std::make_unique<SimulatorSource>();
 
+        sig::install();
+
         tui::render_dashboard(*view_, *filters_, fpid_, state_);
         view_->mark_drawn();
         int64_t last_draw = now_ms();
@@ -602,6 +648,28 @@ public:
             int src = source_->fd();
             if (src >= 0) { pf[1].fd = src; pf[1].events = POLLIN; nfd = 2; }
             poll(pf, nfd, 10);
+
+            if (sig::g_quit) break;
+            if (sig::g_stop) {
+                // Ctrl-Z: hand the terminal back, stop for real, and take
+                // it again (with a full repaint) after SIGCONT.
+                sig::g_stop = 0;
+                term_->leave();
+                sig::set(SIGTSTP, SIG_DFL);
+                ::raise(SIGTSTP);
+                sig::set(SIGTSTP, sig::on_stop);
+                term_->enter();
+                sig::g_winch = 1;
+            }
+            if (sig::g_winch) {
+                sig::g_winch = 0;
+                state_.frame_cache.clear();
+                std::fputs("\033[2J", stdout);
+                tui::render_dashboard(*view_, *filters_, fpid_, state_);
+                view_->mark_drawn();
+                last_draw = now_ms();
+                continue;
+            }
 
             if (pf[0].revents & POLLIN) {
                 int key = read_key();
@@ -643,5 +711,15 @@ private:
 };
 
 int main(int argc, char **argv) {
-    return App{}.run(argc, argv);
+    try {
+        // App (and with it the Terminal) is destroyed before the handler
+        // runs, so the terminal is restored before the error is printed.
+        App app;
+        return app.run(argc, argv);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "syswatch: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "syswatch: unexpected error\n");
+    }
+    return 1;
 }
