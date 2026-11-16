@@ -216,7 +216,8 @@ Threading: the TUI runs on one thread. In simulator mode a generator thread writ
 ├── capture.cpp / capture.hpp  quote_pipe and the capture file
 ├── types.hpp                  UiEvent, Sort, Key, IView
 ├── mock_generator.hpp         fake events (through a pipe) when the device is missing
-└── mock_test.cpp              tests: ABI, decoder, filters, sanitizer, syscall table, view
+├── mock_test.cpp              tests: ABI, decoder, filters, sanitizer, syscall table, view
+└── tests/qemu/                kernel module tests in a QEMU VM (see its README)
 
 filters.xml is not tracked. The TUI writes a default one when it is missing,
 and deploy.sh writes one from the running session if there is none.
@@ -329,6 +330,13 @@ Mock checks, no kernel required:
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
+```
+
+Kernel module tests in a VM, no root and no module on the host: [`tests/qemu`](tests/qemu/README.md) builds the module, static test programs and a static TUI, boots a (debug) kernel in QEMU with a busybox initramfs, and checks permissions, ioctls, read/poll semantics, 32-bit callers, the TUI on a pty, `rmmod`, and that the kernel log has no KASAN, lockdep or `BUG` reports.
+
+```bash
+KERNEL_SRC=/path/to/linux-6.12.x tests/qemu/build-kernel.sh   # once
+KERNEL_SRC=/path/to/linux-6.12.x tests/qemu/run.sh
 ```
 
 Unload:

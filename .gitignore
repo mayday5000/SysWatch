@@ -1,3 +1,4 @@
 build/
 filters.xml
 strace_*.log
+tests/qemu/out/

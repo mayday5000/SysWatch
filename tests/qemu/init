@@ -1,0 +1,36 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: MIT
+# PID 1 of the test VM: load the module, run the tests, unload, power off.
+# run.sh reads the serial log between "=== insmod" and "=== DONE".
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+
+echo "=== insmod"
+insmod /syscall_monitor.ko && echo insmod-ok
+dmesg | grep -i syscall_monitor
+ls -l /dev/syscall_monitor
+
+for t in /kmod_test /kmod_test32; do
+    [ -x "$t" ] && { echo "=== $t"; "$t"; }
+done
+
+if [ -x /syswatch ]; then
+    echo "=== TUI on a pty"
+    /noise & NOISE=$!
+    /ptyrun /syswatch
+    kill $NOISE
+fi
+
+exec 3</dev/syscall_monitor
+echo "=== rmmod while open"
+rmmod syscall_monitor && echo "rmmod-UNEXPECTED-ok" || echo "rmmod-busy-ok"
+exec 3<&-
+rmmod syscall_monitor && echo rmmod-ok
+
+echo "=== dmesg"
+dmesg | grep -iE "BUG|WARNING|syscall_monitor|lockdep|sleeping|KASAN|UBSAN" | tail -n 40
+echo "=== DONE"
+poweroff -f
