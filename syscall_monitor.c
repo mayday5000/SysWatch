@@ -32,9 +32,9 @@
  */
 
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_AUTHOR("Kernel Architecture Team");
+MODULE_AUTHOR("Damian Andres Ulanowicz");
 MODULE_DESCRIPTION("Multi-Reader Parameter-Hooking Tracepoint Monitor");
-MODULE_VERSION("1.1");
+MODULE_VERSION("1.2");
 
 #define DEVICE_NAME      "syscall_monitor"
 #define CLASS_NAME       "syscall_mon"

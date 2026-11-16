@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20...3.31)
 
 project(SysWatch
-    VERSION 1.0.0
+    VERSION 1.2.0
     DESCRIPTION "Kernel syscall telemetry with a C++23 TUI"
     LANGUAGES CXX
 )
@@ -108,6 +108,10 @@ target_include_directories(syswatch_core
     PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 target_link_libraries(syswatch_core PRIVATE syswatch_warnings)
+# One version string for the TUI title and --help; keep it in step with
+# MODULE_VERSION in syscall_monitor.c.
+target_compile_definitions(syswatch_core PUBLIC
+    SYSWATCH_VERSION="${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 
 # -----------------------------------------------------------------------------
 # TUI executable

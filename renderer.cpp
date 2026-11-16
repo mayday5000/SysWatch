@@ -19,6 +19,7 @@ bool refresh_due(int64_t now_ms, int64_t last_ms, bool dirty, int64_t interval_m
 #include <unistd.h>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cstdio>
 #include <ctime>
@@ -67,11 +68,14 @@ static void render_top_title_panel(const IView &view, int32_t screen_cols, const
     move_cursor(1, 1);
     std::fwrite(ansi::bg_blue_white_bold.data(), 1, ansi::bg_blue_white_bold.size(), stdout);
     
-    std::fputs("  Syscall Monitor v1.00 │ ", stdout);
+    static constexpr std::string_view title = "  Syscall Monitor v" SYSWATCH_VERSION " │ ";
+    std::fwrite(title.data(), 1, title.size(), stdout);
     std::fputs(clock_str.c_str(), stdout);
     std::fputs(" │ ", stdout);
 
-    int32_t used = 32 + static_cast<int32_t>(clock_str.length());
+    // "│" is three bytes but one column wide; three spare columns as before.
+    int32_t used = static_cast<int32_t>(title.size()) - 2 + 3 + 3
+                 + static_cast<int32_t>(clock_str.length());
 
     if (state.overlay == OverlayMode::InspectLsof) {
         std::fputs("INSPECTING OPEN FILES (lsof)", stdout);
