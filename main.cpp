@@ -33,6 +33,7 @@
 #include <map>
 #include <span>
 #include <utility>
+#include <vector>
 
 // Compile-time check that the ring size is a power of two. The kernel
 // indexes the ring with a mask; a non-power-of-two size would wrap wrong.
@@ -125,9 +126,9 @@ static int read_key() {
 }
 
 struct EventLoopContext {
-    IFilterStore *filters;
-    Capture *cap;
-    IView *view;
+    IFilterStore *filters = nullptr;
+    Capture *cap = nullptr;
+    IView *view = nullptr;
 };
 
 // decode_events walks a read() buffer as whole records. std::span carries
@@ -486,31 +487,38 @@ static void handle_standard_dashboard_input(int key, IView &view, Capture &cap, 
     view.on_key(static_cast<Key>(key));
 }
 
+// Both sources hand the main loop a pollable fd that yields whole 176-byte
+// records. Everything after read() runs on the main thread.
 class EventSource {
 public:
     virtual ~EventSource() = default;
-    virtual int fd() const { return -1; }
-    virtual void ingest(EventLoopContext &) {}
+    virtual int fd() const = 0;
+    void ingest(EventLoopContext &ctx) {
+        const int src = fd();
+        if (src < 0) return;
+        ssize_t n = ::read(src, buf_.data(), buf_.size());
+        if (n > 0)
+            decode_events(std::span<const uint8_t>(buf_.data(), static_cast<size_t>(n)),
+                          on_raw_kernel_event, &ctx);
+    }
+private:
+    // Allocated once, sized for a full ring, reused for every read.
+    std::vector<uint8_t> buf_ = std::vector<uint8_t>(SM_EVENT_RING_SIZE * SM_EVENT_SIZE);
 };
 
 class DeviceSource final : public EventSource {
 public:
     explicit DeviceSource(Fd &dev) : dev_(dev) {}
     int fd() const override { return dev_.get(); }
-    void ingest(EventLoopContext &ctx) override {
-        alignas(sm_event) std::array<uint8_t, SM_EVENT_RING_SIZE * SM_EVENT_SIZE> buf{};
-        ssize_t n = ::read(dev_.get(), buf.data(), buf.size());
-        if (n > 0)
-            decode_events(std::span<const uint8_t>(buf.data(), static_cast<size_t>(n)),
-                          on_raw_kernel_event, &ctx);
-    }
 private:
     Fd &dev_;
 };
 
+// The generator thread only writes records into a pipe; see mock_generator.hpp.
 class SimulatorSource final : public EventSource {
 public:
-    explicit SimulatorSource(EventLoopContext &ctx) { mock_.start(on_raw_kernel_event, &ctx); }
+    SimulatorSource() { mock_.start(); }
+    int fd() const override { return mock_.fd(); }
 private:
     MockEventGenerator mock_;
 };
@@ -575,9 +583,9 @@ public:
         load_syscall_names(state_);
         view_ = std::make_unique<View>(20);
         term_ = std::make_unique<Terminal>();
-        EventLoopContext ctx{filters_.get(), &cap_, view_.get()};
+        ctx_ = EventLoopContext{filters_.get(), &cap_, view_.get()};
         if (dev_) source_ = std::make_unique<DeviceSource>(*dev_);
-        else      source_ = std::make_unique<SimulatorSource>(ctx);
+        else      source_ = std::make_unique<SimulatorSource>();
 
         tui::render_dashboard(*view_, *filters_, fpid_, state_);
         view_->mark_drawn();
@@ -605,7 +613,7 @@ public:
                 continue;
             }
             if (src >= 0 && (pf[1].revents & POLLIN))
-                source_->ingest(ctx);
+                source_->ingest(ctx_);
             int64_t now = now_ms();
             if (view_->dirty() && now - last_draw >= state_.refresh_ms) {
                 tui::render_dashboard(*view_, *filters_, fpid_, state_);
@@ -613,6 +621,9 @@ public:
                 last_draw = now;
             }
         }
+        // Stop the simulator thread (if any) while everything it could
+        // reference is still alive.
+        source_.reset();
         return 0;
     }
 private:
@@ -622,8 +633,10 @@ private:
     std::unique_ptr<FilterStore> filters_;
     std::unique_ptr<View> view_;
     std::unique_ptr<Terminal> term_;
-    std::unique_ptr<EventSource> source_;
     Capture cap_;
+    EventLoopContext ctx_{};
+    // Declared last so it is destroyed first.
+    std::unique_ptr<EventSource> source_;
 };
 
 int main(int argc, char **argv) {
