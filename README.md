@@ -181,6 +181,7 @@ Release builds pass `-O3` and `-march=native`, and turn on LTO when the toolchai
 ```text
 .
 ├── LICENSE
+├── THIRD_PARTY_NOTICES.md
 ├── README.md
 ├── CMakeLists.txt             project SysWatch, C++23, binary syswatch
 ├── Makefile                   kernel module, objects in ./build
@@ -321,3 +322,5 @@ sudo rmmod syscall_monitor
 **License**
 
 This project is licensed under the [<u>MIT License</u>](https://github.com/mayday5000/SysWatch/blob/main/LICENSE). Copyright (c) 2026 Damian Andres Ulanowicz.
+
+The kernel module declares `MODULE_LICENSE("Dual MIT/GPL")` so it can use GPL-only tracepoint symbols. Third-party components it builds against are listed in [THIRD_PARTY_NOTICES.md](https://github.com/mayday5000/SysWatch/blob/main/THIRD_PARTY_NOTICES.md).

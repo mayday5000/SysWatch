@@ -26,7 +26,7 @@
  * cursor and its own ioctl filters. The probe does not sleep.
  */
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Kernel Architecture Team");
 MODULE_DESCRIPTION("Multi-Reader Parameter-Hooking Tracepoint Monitor");
 MODULE_VERSION("1.1");
