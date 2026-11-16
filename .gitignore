@@ -1,0 +1,3 @@
+build/
+filters.xml
+strace_*.log

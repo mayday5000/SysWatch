@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# deploy: detect the compiler, write filters.xml,
+# deploy: detect the compiler, seed filters.xml if there is none,
 # build userspace and the kernel module, load the module. Does not start the TUI.
-#   ./deploy.sh            build both, load the module
-#   ./deploy.sh --no-run   build only
+#   ./deploy.sh                    build both, load the module
+#   ./deploy.sh --no-run           build only
+#   ./deploy.sh --refresh-filters  also rewrite an existing filters.xml
+# Run it as a normal user (it calls sudo where root is needed) or as root.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -16,9 +18,28 @@ UDEV_RULE_FILE="/etc/udev/rules.d/99-${MODULE_NAME}.rules"
 BUILD_DIR="build"
 KMOD_DIR="${BUILD_DIR}/kmod"
 NO_RUN=0
+REFRESH_FILTERS=0
 for arg in "$@"; do
-    [[ "$arg" == "--no-run" ]] && NO_RUN=1
+    case "$arg" in
+        --no-run)          NO_RUN=1 ;;
+        --refresh-filters) REFRESH_FILTERS=1 ;;
+        -h|--help)         sed -n '2,7p' "$0"; exit 0 ;;
+        *)                 log_err "unknown option: $arg"; exit 2 ;;
+    esac
 done
+
+# Root needs no sudo; everyone else needs sudo for packages and insmod.
+if [[ "$(id -u)" -eq 0 ]]; then
+    SUDO=()
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO=(sudo)
+else
+    SUDO=(need_root)
+fi
+need_root() {
+    log_err "'$*' needs root and sudo is not installed; run ./deploy.sh as root"
+    return 1
+}
 
 ensure_pkg() {
     local bin="$1" pkg="$2"
@@ -28,11 +49,11 @@ ensure_pkg() {
     fi
     log_info "installing $pkg"
     if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update && sudo apt-get install -y "$pkg"
+        "${SUDO[@]}" apt-get update && "${SUDO[@]}" apt-get install -y "$pkg"
     elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y "$pkg"
+        "${SUDO[@]}" dnf install -y "$pkg"
     elif command -v yum >/dev/null 2>&1; then
-        sudo yum install -y "$pkg"
+        "${SUDO[@]}" yum install -y "$pkg"
     else
         log_warn "no package manager; install $pkg manually"
         return 1
@@ -85,8 +106,14 @@ if ! command -v "$CXX_BIN" >/dev/null 2>&1; then
     exit 1
 fi
 
-log_info "writing filters.xml"
-emit_filters || log_warn "filter probe failed; keeping existing filters.xml"
+# filters.xml holds the user's own rules (the TUI saves to it), so an
+# existing file is only rewritten on request.
+if [[ -f filters.xml && "$REFRESH_FILTERS" -eq 0 ]]; then
+    log_info "keeping existing filters.xml (--refresh-filters rewrites it)"
+else
+    log_info "writing filters.xml"
+    emit_filters || log_warn "filter probe failed; the TUI seeds a default filters.xml"
+fi
 
 log_info "removing old objects"
 rm -f ./*.o ./*.cmd ./*.ko ./*.mod ./*.mod.c ./Module.symvers ./modules.order
@@ -121,13 +148,17 @@ fi
 # is checked again in open().
 if [[ -f "${UDEV_RULE_FILE}" ]]; then
     log_info "removing legacy world-readable udev rule ${UDEV_RULE_FILE}"
-    sudo rm -f "${UDEV_RULE_FILE}"
-    sudo udevadm control --reload-rules || true
+    "${SUDO[@]}" rm -f "${UDEV_RULE_FILE}"
+    "${SUDO[@]}" udevadm control --reload-rules || true
 fi
 if grep -q "^${MODULE_NAME} " /proc/modules 2>/dev/null; then
     log_info "unloading existing ${MODULE_NAME}"
-    sudo rmmod "${MODULE_NAME}" || true
+    "${SUDO[@]}" rmmod "${MODULE_NAME}" || true
 fi
 log_info "insmod ${KMOD_DIR}/${MODULE_NAME}.ko"
-sudo insmod "${KMOD_DIR}/${MODULE_NAME}.ko"
-log_info "installed. next: sudo ./${BUILD_DIR}/syswatch"
+"${SUDO[@]}" insmod "${KMOD_DIR}/${MODULE_NAME}.ko"
+if [[ "$(id -u)" -eq 0 ]]; then
+    log_info "installed. next: ./${BUILD_DIR}/syswatch"
+else
+    log_info "installed. next: sudo ./${BUILD_DIR}/syswatch"
+fi
