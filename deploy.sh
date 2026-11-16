@@ -14,6 +14,7 @@ log_err()  { echo -e "${BOLD}${RED}[ERROR]${RESET} $1" >&2; }
 MODULE_NAME="syscall_monitor"
 UDEV_RULE_FILE="/etc/udev/rules.d/99-${MODULE_NAME}.rules"
 BUILD_DIR="build"
+KMOD_DIR="${BUILD_DIR}/kmod"
 NO_RUN=0
 for arg in "$@"; do
     [[ "$arg" == "--no-run" ]] && NO_RUN=1
@@ -89,10 +90,7 @@ emit_filters || log_warn "filter probe failed; keeping existing filters.xml"
 
 log_info "removing old objects"
 rm -f ./*.o ./*.cmd ./*.ko ./*.mod ./*.mod.c ./Module.symvers ./modules.order
-rm -f "${BUILD_DIR}"/*.o "${BUILD_DIR}"/*.cmd "${BUILD_DIR}"/*.ko \
-      "${BUILD_DIR}"/*.mod "${BUILD_DIR}"/*.mod.c \
-      "${BUILD_DIR}"/Module.symvers "${BUILD_DIR}"/modules.order
-rm -rf "${BUILD_DIR}"/.tmp_versions
+rm -rf "${KMOD_DIR}"
 
 log_info "configuring userspace"
 cmake -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
@@ -100,7 +98,7 @@ CORES=$(nproc 2>/dev/null || echo 2)
 log_info "building userspace with ${CORES} cores"
 cmake --build "${BUILD_DIR}" --config Release -j "${CORES}"
 
-log_info "building kernel module into ./build"
+log_info "building kernel module into ./${KMOD_DIR}"
 if [[ -d "/lib/modules/$(uname -r)/build" ]]; then
     make module
 else
@@ -112,8 +110,8 @@ if [[ "$NO_RUN" -eq 1 ]]; then
     exit 0
 fi
 
-if [[ ! -f ${BUILD_DIR}/${MODULE_NAME}.ko ]]; then
-    log_warn "no ${BUILD_DIR}/${MODULE_NAME}.ko; TUI can still run in simulator mode"
+if [[ ! -f "${KMOD_DIR}/${MODULE_NAME}.ko" ]]; then
+    log_warn "no ${KMOD_DIR}/${MODULE_NAME}.ko; TUI can still run in simulator mode"
     exit 0
 fi
 
@@ -130,6 +128,6 @@ if grep -q "^${MODULE_NAME} " /proc/modules 2>/dev/null; then
     log_info "unloading existing ${MODULE_NAME}"
     sudo rmmod "${MODULE_NAME}" || true
 fi
-log_info "insmod ${BUILD_DIR}/${MODULE_NAME}.ko"
-sudo insmod "${BUILD_DIR}/${MODULE_NAME}.ko"
+log_info "insmod ${KMOD_DIR}/${MODULE_NAME}.ko"
+sudo insmod "${KMOD_DIR}/${MODULE_NAME}.ko"
 log_info "installed. next: sudo ./${BUILD_DIR}/syswatch"
